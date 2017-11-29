@@ -1,0 +1,342 @@
+---
+title: "Predicting the default of lending club loans"
+author: "Vasanth Kailasam"
+date: "9/28/2017"
+output: 
+    html_document:
+      number_sections: FALSE
+      toc : true
+      fig_width: 7
+      fig_height: 4.5
+      theme: readable
+      highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Introduction
+For this data science project, I have downloaded the Lending Club data from the lending club's website. The goal of this project is to predict whether loans will default or not, given various information about the loans. 
+
+##Loading Libraries and Data
+```{r message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(corrplot)
+library(zoo)
+library(plyr)
+library(magrittr)
+library(ROSE)
+library(caTools)
+library(ROCR)
+library(caret)
+library(randomForest)
+setwd("~/Documents/Data Mining Slides/R and associated")
+loandata <- read_csv("LoanLatest.csv")
+```
+
+#Data Cleaning
+
+##DataSet Structure
+```{r}
+dim(loandata)
+head(loandata)
+```
+
+There are 42540 observations with 137 variables. A lot of those 137 variables are irrelevant for our current objective of default prediction. A thorough understanding of the domain and all the variables is necessary to remove irrelevant variables, so I used the lending club's data dictionary as well as the orchard platform's explanations of the workings of the lending world to identify and remove these variables. Links: 
+
+LC Dictionary - https://help.lendingclub.com/hc/en-us/articles/216127307-Data-Dictionaries
+
+Orchard Platform - https://www.orchardplatform.com/blog/credit-variables-explained-inquiries-in-the-last-6-months/
+
+```{r}
+loandata1 <- loandata %>% 
+              select(loan_status, issue_d, loan_amnt, emp_title, emp_length, verification_status, 
+                            home_ownership, annual_inc, purpose, inq_last_6mths, desc,
+                            open_acc, pub_rec, revol_util, dti, total_acc, delinq_2yrs, 
+                            earliest_cr_line, mths_since_last_delinq)
+```
+
+Now let's have a look at the dataset with all those irrelevant variables removed. 
+```{r}
+head(loandata1)
+```
+
+##Target Variable
+The target variable 'Default' is recoded into numeric terms. 
+```{r}
+loandata2 <- loandata1 %>% 
+              mutate(default = ifelse(loan_status=="Charged Off",1,0))
+```
+
+The earliest credit line and issued dates are given in the form of month and year. In order to use these variables for prediction, we are converting them into date using the yearmon package from 'zoo' library.
+
+```{r}
+
+loandata2$earliest_cr_line <- as.Date(as.yearmon(loandata$earliest_cr_line, "%b-%y"))
+loandata2$issue_d <- as.Date(as.yearmon(loandata$issue_d, "%b-%y"))
+```
+
+##Feature Engineering - Age of the Credit Account
+These dates cannot be used as it is, so we are calcuating a new variable - the difference between account opening and credit line opening. This will indirectly give the age of the credit lines, which is a crucial factor in determining credit. Even for credit cards, the age of the credit account is taken into account to compute the credit scores. 
+
+```{r}
+loandata3 <- loandata2 %>%
+              mutate(time_history = issue_d - earliest_cr_line) 
+```
+
+##Cleaning utilization percentage
+Revol_util indicates the utilization percentage of the credit. It is expressed in terms of percentage. To make it useful to our analysis, we are removing the needless character symbol and converting it into a numeric variable. 
+
+```{r}
+head(loandata3$revol_util)
+loandata4 <- loandata3 %>%
+  mutate(revol_util = as.numeric(sub("%","", revol_util)) )
+head(loandata4$revol_util)
+```
+
+##Feature Engineering -  the presence of employer and other details
+The three variables - Employer Title, Loan Reason Description, and months since last delinquency - can be used as important predictor variables but has to be coded differently. For example, employer title can be separated into those who have mentioned employer title and those who have not. In the same vein, loan reason and delinquency can also leveled using NAs. 
+
+```{r}
+loandata5 <- loandata4 %>%
+  mutate(empdetailgiven = as.numeric(!is.na(emp_title)),
+         reasonforloan = as.numeric(!is.na(desc)), 
+         previousdefault = as.numeric(!is.na(mths_since_last_delinq)) ) 
+```
+
+##Recoding home ownership and employer length variables
+Other variables such as home ownership, and employment length are also reformatted in suitable ways. Home ownership into three levels and employment length as a continuous numeric after removing the missing variables. Employment length less than a year is coded as zero. 
+
+```{r}
+loandata6 <- loandata5 %>%
+  mutate(emplengthgiven = ifelse(emp_length == "n/a", 1, 0),
+         emp_length = ifelse(emp_length == "< 1 year" | emp_length == "n/a", 0, emp_length),
+         emp_length = as.numeric(gsub("\\D", "", emp_length)),
+         home_ownership = ifelse(home_ownership == "NONE", "OTHER", home_ownership))
+```
+
+##Final Aggregated dataset
+As we have removed the missing values, transformed and recoded our variables, we are agrregating it into a new dataset, including the computed columns.
+
+```{r}
+loandata7 <- loandata6 %>% 
+         select(default, loan_amnt, reasonforloan, empdetailgiven, emplengthgiven, emp_length, verification_status, 
+         home_ownership, annual_inc, purpose, time_history, inq_last_6mths, 
+         open_acc, pub_rec, revol_util, dti, total_acc, delinq_2yrs, previousdefault)
+```
+
+##Formatting factors and numerics
+Now we are going to format the variables into factors and numeric variables so as to enable modeling. I am using the mutate_each function from the tidyverse package which does a neat job of factorizing many columns at once.  
+```{r}
+factorcolumns <- c("default", "reasonforloan", "empdetailgiven", "emplengthgiven",
+                   "verification_status", "home_ownership", "purpose", "previousdefault")
+loandata7 %<>% mutate_each_(funs(factor(.)), factorcolumns)
+loandata7$time_history <- as.numeric(loandata7$time_history)
+```
+
+#Data Exploration
+
+Firstly, I want to check the distribution of the loan amount. It is one of the most important and primary feature in our dataset. 
+
+##Loan Amount Histogram
+```{r message=FALSE}
+Loanamountdist <- ggplot(data=loandata7, aes(x=loandata7$loan_amnt)) + 
+  geom_histogram(aes(y=..density..),
+                 col='black', 
+                 fill='dodgerblue1', 
+                 alpha=0.3) +
+  geom_density(adjust=3)
+
+print(Loanamountdist + theme(plot.title=element_text(face="bold")) + ggtitle('Distribution of the loan amounts'))
+
+```
+
+The distribution is right-skewed as we would normally expect for this kind of variable. A lot of the loans have amounts less than 10000, which is accurate considering the customer base of the company.
+
+## Segmented Bar Chart - Home Ownership
+Nextly the home ownership variable is another crucial predictor of the default. Intuition would say that home owners would be good borrowers and people on rent or mortgage would be bad investment. But does the data say the same? Let's see. 
+
+```{r}
+
+homedist <- ggplot(data=loandata7, aes(x=loandata7$home_ownership, fill=default)) + 
+  geom_bar(aes(y = (..count..)/sum(..count..)), position='stack', alpha=0.5) + scale_y_continuous(labels=scales::percent)
+
+print(homedist + theme(plot.title=element_text(face="bold")) + ggtitle('Home Ownership vs Loan Default'))
+
+```
+
+The data as well backs up our theory. In fact, as we would expect, people on mortgage has done worse than people living on rented homes. 
+
+## Age of the Credit Lines
+Now let's move on to some of the other interesting variables. The age of the credit accounts. Let us compare it with the target default. 
+
+```{r message=FALSE}
+
+loandata7$time_history <- abs(loandata7$time_history)
+
+CreditAge <- ggplot(data=loandata7, aes(x=loandata7$time_history, fill=default)) + 
+  geom_histogram(alpha=0.5) 
+
+print(CreditAge + theme(plot.title=element_text(face="bold")) + ggtitle('Credit Account Age vs Default'))
+
+```
+
+There does not seem to be much difference between defaulted loans. The distribution is similar, centred around 5000, with a right skew and higher frequences to the left of the median line. Below 5000, loans seem to have a much higher possibility of default, and conversely, after 5000, the loans seem to have lesser probability of default. So seems like it is safe to lend money to older accounts. 
+
+
+#Statistical Tests
+
+##Chi-square test for all combinations of factor variables
+Chi-square test is done to find relations between factor variables. It will give us insights into variables of high predictive capacity and also of redundant factor variables. We are using the combn function to find all possible combinations of the factor columns, and this is then fed into the 'adply' with an anonymous function written for chi test. 
+
+```{r message=FALSE}
+loandata9 <- loandata7[factorcolumns]
+combos <- combn(ncol(loandata9),2)
+adply(
+          combos, 
+          2, 
+          function(x) {
+                          test <- chisq.test(collect(loandata9[,x[1]])[[1]],collect(loandata9[,x[2]])[[1]])
+                          out <- data.frame(
+                                                "Column 1" = colnames(loandata9)[x[1]],
+                                                "Column 2" = colnames(loandata9)[x[2]],
+                                                "Chi.Square" = round(test$statistic, 3),
+                                                "df" = test$parameter,
+                                                "p.value" = round(test$p.value,3)
+                                            )
+                          return(out)
+                      }
+      )
+
+
+```
+
+We use this information to remove the factor variables that does not have a strong relation with the 
+target variable default. 
+
+
+##Correlation and multicollinearity
+Next, we find the correlation betweeen numeric variables. This will yield us insight into multicollinearity. 
+
+```{r message=FALSE}
+numcol <- sapply(loandata7,is.numeric)
+pearsoncor <- cor(loandata7[numcol], use="complete.obs")
+corrplot(pearsoncor, "number")
+```
+
+From the corrplot we can see that open_acc and total_acc are the only two variables to have any meaningful expression of multicollinearity. Let us have a look at the distribution of these two.
+
+```{r message=FALSE}
+
+openaccplot <- ggplot(loandata7, aes(open_acc)) + geom_histogram(col='black',fill='dodgerblue1', alpha=0.3) 
+
+print(openaccplot + theme(plot.title=element_text(face="bold")) + ggtitle('Histogram of number of open accounts'))
+  
+  
+totaccplot <- ggplot(loandata7, aes(total_acc)) + geom_histogram(col='black',fill='dodgerblue1', alpha=0.3)
+
+print(totaccplot + theme(plot.title=element_text(face="bold")) + ggtitle('Histogram of total number of accounts')) 
+```
+
+##ANOVA test 
+This is done to determine whether total account or open account has stronger relation with the target default variable. 
+
+```{r message=FALSE}
+plot(open_acc ~ default, data=loandata7)
+plot(total_acc ~ default, data=loandata7)
+results <- aov(open_acc ~ default, data=loandata7)
+summary(results)
+results2 <- aov(total_acc ~ default, data=loandata7)
+summary(results2)
+```
+
+From the results, it can be seen that the variable total accounts has stronger relations to default variable. So we are choosing total account variable over open account, to remove multicollinearity. 
+
+```{r}
+index <- which(colnames(loandata7)=="open_acc")
+loandata10 <- loandata7[,-c(index)]
+```
+
+# Sampling
+
+Our dataset is highly skewed. A lot of observations have not defaulted while very few have defaulted.
+We can see this from the following result. 
+
+```{r}
+table(loandata10$default)
+```
+We can see that there are 5670 rows with default (1) and 36,865 rows that are not default (0)
+
+##ROSE package and undersampling
+We are performing undersampling using the 'ROSE' package to balance our dataset. 
+
+```{r}
+balanceddata <- ovun.sample(default ~ . , 
+                            data=loandata10, method = "under", N = 11340, seed = 1)$data
+table(balanceddata$default)
+
+```
+
+Now we can see that both default and non-default have same number of rows, around 5600. 
+
+
+## Test and Train Split
+
+```{r}
+set.seed(101) 
+sample <- sample.split(balanceddata$default, SplitRatio = .75)
+train <- subset(balanceddata, sample == TRUE)
+test  <- subset(balanceddata, sample == FALSE)
+```
+
+We have split our loan dataset in the ratio of 0.75. 
+
+#Modeling
+
+##Logistic Regression
+```{r logistic chunk}
+logisticreg <- glm(default~., family=binomial(link='logit'), data = train)
+actualvalues <- test$default
+pred <- predict(logisticreg,test, type ='response')
+pred <- ifelse(pred > 0.5,1,0)
+compare <- data.frame(actual = actualvalues, predicted = pred)
+misClasificError <- mean(pred != actualvalues)
+print(paste('Accuracy',1-misClasificError))
+```
+
+##Random Forest
+```{r rf chunk}
+rfmodel <- randomForest(default ~ loan_amnt + reasonforloan + empdetailgiven + emplengthgiven
+                        + verification_status + home_ownership + annual_inc + purpose
+                        + previousdefault + pub_rec, data=train, importance = TRUE, ntree = 200, na.action = na.omit)
+predrf <- predict(rfmodel, test, type='class')
+rfoutput <- confusionMatrix(test$default, predrf)
+paste0(rfoutput$overall[1])
+```
+
+#Comparison of our classifiers
+
+##ROC curve
+```{r}
+val <- as.numeric(paste0(pred))
+predObj <- prediction(val,actualvalues)
+rocObj <- performance(predObj, measure="tpr", x.measure="fpr") 
+aucObj <- performance(predObj, measure="auc")
+
+
+predrfprob <- predict(rfmodel, test, type = "prob")
+val2 <- as.numeric(paste0(predrfprob[,2]))
+predObj2 <- prediction(val2, actualvalues)
+rocObj2 <- performance(predObj2, measure="tpr", x.measure="fpr") 
+aucObj2 <- performance(predObj2, measure="auc")
+
+plot(rocObj, col = "blue", lwd = 1, main = "ROC Curves")
+plot(rocObj2, add = TRUE, col = "red")
+abline(a=0, b=1)
+```
+
+The ROC curve is used to compare classifiers. The above graph is a plot between true positive rate and false positive rate. Both are also known as sensitivity and 1-specificity. Area Under the Curve is a measurement used to compare the performance precisely. The more the area under the curve the higher the performance and predictive accuracy of the model. From the above graph we can see that the random
+forest model performs better than the logistic regression model. 
+
